@@ -3,7 +3,7 @@ import contextlib
 import threading
 import time
 from PIL import Image
-from PIL import ImageDraw
+from PIL import ImageDraw, ImageFont
 from pycoral.adapters import classify
 from pycoral.adapters import common
 from pycoral.adapters import detect
@@ -11,6 +11,9 @@ from pycoral.utils.edgetpu import list_edge_tpus
 from pycoral.utils.edgetpu import make_interpreter
 import numpy as np
 import cv2
+
+from utils import _keypoints_and_edges_for_display
+
 def draw_objects(draw, objs):
   """Draws the bounding box and label for each object."""
   for obj in objs:
@@ -26,7 +29,7 @@ def non_max_suppression(objects, threshold):
   Args:
     objects: result candidates.
     threshold: the threshold of overlapping IoU to merge the boxes.
-
+..
   Returns:
     A list of indexes containings the objects that pass the NMS.
   """
@@ -94,11 +97,6 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
         count+=1
         results.append(objs[i])
       num_people.append(count)
-      #print(len(results))
-      #image = image.convert('RGB')
-      #draw_objects(ImageDraw.Draw(image), results)
-      #image.save('detection_result.jpg')
-      #image.show()
     cap.release()
   def pose_estimation_job(pose_estimation_model, image_name, num_inferences,results):
     """Runs pose_estimation job."""
@@ -109,7 +107,8 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
     ret,test=cap.read()
     test = Image.fromarray(cv2.cvtColor(test,cv2.COLOR_BGR2RGB))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter('result.mp4', fourcc, 20.0, test.size)
+    out = cv2.VideoWriter('result.mp4', fourcc, 30, test.size)
+    font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 16)
     global index
     index=0
     frame_number=0
@@ -131,24 +130,38 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
         index=index+1
         bbox=results[k].bbox
         cropped_img = image.crop((bbox.xmin,bbox.ymin,bbox.xmax,bbox.ymax))
+        
         resized_img = cropped_img.resize(common.input_size(interpreter), Image.ANTIALIAS)
         common.set_input(interpreter, resized_img)
         interpreter.invoke()
-        pose = common.output_tensor(interpreter, 0).copy().reshape(_NUM_KEYPOINTS, 3)
+
+
+        
+        keypoints_with_scores = common.output_tensor(interpreter, 0).copy()
+        
+        pose = keypoints_with_scores.reshape(_NUM_KEYPOINTS, 3)
         draw = ImageDraw.Draw(cropped_img)
         width, height = cropped_img.size
-        for i in range(0, _NUM_KEYPOINTS):
-          draw.ellipse(
+        draw.rectangle([(0.01,0.01), (width-0.01, height-0.01)],outline='green', width=2)
+        (keypoint_locs, keypoint_edges, edge_colors)  = _keypoints_and_edges_for_display(keypoints_with_scores, height, width)
+        
+        for i, edge in enumerate(keypoint_edges):
+          if i < _NUM_KEYPOINTS:
+            draw.ellipse(
                 xy=[
                     pose[i][1] * width - 2, pose[i][0] * height - 2,
                     pose[i][1] * width + 2, pose[i][0] * height + 2
                 ],
               fill=(255, 0, 0))
+          draw.line(edge)
+        draw.rectangle((2,2, 90, 30), fill='green')
+        draw.text((5,5), "02-shake", align ="left", font=font) 
         image.paste(cropped_img,(bbox.xmin,bbox.ymin))
+        
+  
       image = cv2.cvtColor(np.asarray(image),cv2.COLOR_RGB2BGR)
       out.write(image)
       frame_number+=1
-    #img.save('pose_result.jpg')
     cap.release()
 
   start_time = time.perf_counter()
@@ -163,9 +176,9 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
   detection_thread.join()
   pose_estimation_thread.join()
   return time.perf_counter() - start_time
+  
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
       '--pose_estimation_model',
       help='Path of classification model.',
