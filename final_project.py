@@ -13,7 +13,14 @@ import numpy as np
 import cv2
 
 from utils import _keypoints_and_edges_for_display
-
+label = []
+f = open('pose_labels.txt','r')
+for line in f.readlines():
+  line=line.strip('\n')
+  line=line.strip(' ')
+  #print(line)
+  label.append(line)
+f.close()
 def draw_objects(draw, objs):
   """Draws the bounding box and label for each object."""
   for obj in objs:
@@ -69,16 +76,18 @@ def non_max_suppression(objects, threshold):
 
   return selected_idxs
 _NUM_KEYPOINTS = 17
-def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
+def run_two_models_two_tpus(detection_model,pose_estimation_model,video_name,
                             num_inferences):
   results=[]
   num_people=[]
   index = 0
-  def detection_job(detection_model, image_name, num_inferences):
+  def detection_job(detection_model, video_name, num_inferences):
     """Runs detection job."""
     interpreter = make_interpreter(detection_model, device=':1')
+    
     interpreter.allocate_tensors()
-    cap = cv2.VideoCapture('embeded_system_fp.mp4')
+    
+    cap = cv2.VideoCapture(video_name)
     #image = Image.open(image_name)
     while True:
       ret,image = cap.read()
@@ -91,6 +100,8 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
     
       interpreter.invoke()
       objs=detect.get_objects(interpreter, score_threshold=0.5, image_scale=scale)
+      if len(objs)==0:
+        continue
       idx = non_max_suppression(objs,0.1)
       count=0
       for i in idx:
@@ -98,12 +109,14 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
         results.append(objs[i])
       num_people.append(count)
     cap.release()
-  def pose_estimation_job(pose_estimation_model, image_name, num_inferences,results):
+  def pose_estimation_job(pose_estimation_model, video_name, num_inferences,results):
     """Runs pose_estimation job."""
     interpreter = make_interpreter(pose_estimation_model, device=':0')
     interpreter.allocate_tensors()
+    interpreter_classify = make_interpreter('pose_classifier_quant_edgetpu.tflite',device=':0')
+    interpreter_classify.allocate_tensors()
     #img = Image.open(image_name)
-    cap = cv2.VideoCapture('embeded_system_fp.mp4')
+    cap = cv2.VideoCapture(video_name)
     ret,test=cap.read()
     test = Image.fromarray(cv2.cvtColor(test,cv2.COLOR_BGR2RGB))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -119,6 +132,7 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
       while len(results)==0 :
         time.sleep(0.0000000000000001)
       size = len(results)
+      
       print(size)
       image = Image.fromarray(cv2.cvtColor(image,cv2.COLOR_BGR2RGB))
     #imgs = []
@@ -138,8 +152,31 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
 
         
         keypoints_with_scores = common.output_tensor(interpreter, 0).copy()
-        
         pose = keypoints_with_scores.reshape(_NUM_KEYPOINTS, 3)
+        pose_classify=[]
+        params = common.input_details(interpreter_classify, 'quantization_parameters')
+        
+        for i in range(17):
+          for j in range(3):
+            if j==2:
+              pose_classify.append(pose[i][j])
+            else:
+              pose_classify.append(pose[i][j]/params['scales'])
+        if len(pose_classify)==0:
+          continue
+        pose_classify=np.array(pose_classify)
+        pose_classify = pose_classify.reshape((1,17,3))
+        pose_classify = pose_classify.astype(np.uint8)
+        common.set_input(interpreter_classify,pose_classify)
+        params = common.input_details(interpreter_classify, 'quantization_parameters')
+        scale = params['scales']
+        zero_point = params['zero_points']
+        #print(scale)
+        #print(zero_point)
+        interpreter_classify.invoke()
+        classes = classify.get_classes(interpreter_classify, 1, 0.0)
+        for c in classes:
+          print(c)
         draw = ImageDraw.Draw(cropped_img)
         width, height = cropped_img.size
         draw.rectangle([(0.01,0.01), (width-0.01, height-0.01)],outline='green', width=2)
@@ -155,7 +192,8 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
               fill=(255, 0, 0))
           draw.line(edge)
         draw.rectangle((2,2, 90, 30), fill='green')
-        draw.text((5,5), "02-shake", align ="left", font=font) 
+        #print(classes[0].id)
+        draw.text((5,5), label[classes[0].id], align ="left", font=font) 
         image.paste(cropped_img,(bbox.xmin,bbox.ymin))
         
   
@@ -167,10 +205,10 @@ def run_two_models_two_tpus(detection_model,pose_estimation_model,image_name,
   start_time = time.perf_counter()
 
   detection_thread = threading.Thread(
-      target=detection_job, args=(detection_model, image_name, num_inferences))
+      target=detection_job, args=(detection_model, video_name, num_inferences))
   pose_estimation_thread = threading.Thread(
       target=pose_estimation_job,
-      args=(pose_estimation_model, image_name, num_inferences,results))
+      args=(pose_estimation_model, video_name, num_inferences,results))
   detection_thread.start()
   pose_estimation_thread.start()
   detection_thread.join()
@@ -184,8 +222,12 @@ if __name__=='__main__':
       help='Path of classification model.',
       required=True)
     parser.add_argument(
+      '--video',
+      help='input demo video',
+      required=True)
+    parser.add_argument(
       '--detection_model', help='Path of detection model.', required=True)
-    parser.add_argument('--image', help='Path of the image.', required=True)
+    parser.add_argument('--image', help='Path of the image.')
     parser.add_argument(
       '--num_inferences',
       help='Number of inferences to run.',
@@ -197,5 +239,5 @@ if __name__=='__main__':
       type=int,
       default=1)
     args = parser.parse_args()
-    time = run_two_models_two_tpus(args.detection_model,args.pose_estimation_model,args.image,args.num_inferences)
+    time = run_two_models_two_tpus(args.detection_model,args.pose_estimation_model,args.video,args.num_inferences)
     print(time)
